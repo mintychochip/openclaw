@@ -761,6 +761,10 @@ function printMatrixVerificationSasGuidance(requestId: string, accountId?: strin
   ]);
 }
 
+function getMatrixVerificationCommandId(summary: MatrixCliVerificationSummary): string {
+  return sanitizeMatrixCliText(summary.transactionId ?? summary.id);
+}
+
 async function promptMatrixVerificationSasMatch(): Promise<boolean> {
   const { createInterface } = await import("node:readline/promises");
   const prompt = createInterface({
@@ -1258,7 +1262,10 @@ export function registerMatrixCli(params: { program: Command }): void {
           onText: (summary) => {
             printAccountLabel(accountId);
             printMatrixVerificationSummary(summary);
-            printMatrixVerificationRequestGuidance(summary.id, accountId);
+            printMatrixVerificationRequestGuidance(
+              getMatrixVerificationCommandId(summary),
+              accountId,
+            );
           },
           errorPrefix: "Verification request failed",
         });
@@ -1277,7 +1284,7 @@ export function registerMatrixCli(params: { program: Command }): void {
         run: async (accountId, cfg) => await acceptMatrixVerification(id, { accountId, cfg }),
         afterText: (summary, accountId) => {
           printGuidance([
-            `Run '${formatMatrixCliCommand(`verify start ${summary.id}`, accountId)}' to start SAS verification.`,
+            `Run '${formatMatrixCliCommand(`verify start ${getMatrixVerificationCommandId(summary)}`, accountId)}' to start SAS verification.`,
           ]);
         },
         errorPrefix: "Verification accept failed",
@@ -1296,7 +1303,7 @@ export function registerMatrixCli(params: { program: Command }): void {
         run: async (accountId, cfg) =>
           await startMatrixVerification(id, { accountId, cfg, method: "sas" }),
         afterText: (summary, accountId) =>
-          printMatrixVerificationSasGuidance(summary.id, accountId),
+          printMatrixVerificationSasGuidance(getMatrixVerificationCommandId(summary), accountId),
         errorPrefix: "Verification start failed",
       });
     });
