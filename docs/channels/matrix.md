@@ -504,6 +504,30 @@ Verify this device with a recovery key:
 openclaw matrix verify device "<your-recovery-key>"
 ```
 
+This command reports three separate states:
+
+- `Recovery key accepted`: Matrix accepted the recovery key for secret storage or device trust.
+- `Backup usable`: room-key backup can be loaded with trusted recovery material.
+- `Device verified by owner`: the current OpenClaw device has full Matrix cross-signing identity trust.
+
+`Signed by owner` in verbose or JSON output is diagnostic only. OpenClaw does not
+treat that as sufficient unless `Cross-signing verified` is also `yes`.
+
+The command still exits non-zero when full Matrix identity trust is incomplete,
+even if the recovery key can unlock backup material. In that case, complete
+self-verification from another Matrix client:
+
+```bash
+openclaw matrix verify self
+```
+
+Accept the request in another Matrix client, compare the SAS emoji or decimals,
+and type `yes` only when they match. The command waits for Matrix to report
+`Cross-signing verified: yes` before it exits successfully.
+
+Use `verify bootstrap --force-reset-cross-signing` only when you intentionally
+want to replace the current cross-signing identity.
+
 Verbose device verification details:
 
 ```bash
@@ -527,6 +551,23 @@ Restore room keys from server backup:
 ```bash
 openclaw matrix verify backup restore
 ```
+
+Interactive self-verification flow:
+
+```bash
+openclaw matrix verify self
+```
+
+For lower-level or inbound verification requests, use:
+
+```bash
+openclaw matrix verify accept <id>
+openclaw matrix verify start <id>
+openclaw matrix verify sas <id>
+openclaw matrix verify confirm-sas <id>
+```
+
+Use `openclaw matrix verify cancel <id>` to cancel a request.
 
 Verbose restore diagnostics:
 
@@ -566,8 +607,9 @@ In practice, `openclaw matrix verify status --verbose` exposes three trust signa
 - `Cross-signing verified`: the SDK reports the device as verified through cross-signing
 - `Signed by owner`: the device is signed by your own self-signing key
 
-`Verified by owner` becomes `yes` only when cross-signing verification or owner-signing is present.
-Local trust by itself is not enough for OpenClaw to treat the device as fully verified.
+`Verified by owner` becomes `yes` only when cross-signing verification is present.
+Local trust or an owner signature by itself is not enough for OpenClaw to treat
+the device as fully verified.
 
 ### What bootstrap does
 

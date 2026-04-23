@@ -6,11 +6,20 @@ import { resolveMatrixAccount, resolveMatrixAccountConfig } from "./matrix/accou
 import { listMatrixOwnDevices, pruneMatrixStaleGatewayDevices } from "./matrix/actions/devices.js";
 import { updateMatrixOwnProfile } from "./matrix/actions/profile.js";
 import {
+  acceptMatrixVerification,
   bootstrapMatrixVerification,
+  cancelMatrixVerification,
+  confirmMatrixVerificationSas,
+  getMatrixVerificationSas,
   getMatrixRoomKeyBackupStatus,
   getMatrixVerificationStatus,
+  listMatrixVerifications,
+  mismatchMatrixVerificationSas,
+  requestMatrixVerification,
   resetMatrixRoomKeyBackup,
   restoreMatrixRoomKeyBackup,
+  runMatrixSelfVerification,
+  startMatrixVerification,
   verifyMatrixRecoveryKey,
 } from "./matrix/actions/verification.js";
 import { resolveMatrixRoomKeyBackupIssue } from "./matrix/backup-health.js";
@@ -53,7 +62,11 @@ function scheduleMatrixCliExit(): void {
   matrixCliExitScheduled = true;
   // matrix-js-sdk rust crypto can leave background async work alive after command completion.
   setTimeout(() => {
-    process.exit(process.exitCode ?? 0);
+    process.stdout.write("", () => {
+      process.stderr.write("", () => {
+        process.exit(process.exitCode ?? 0);
+      });
+    });
   }, 0);
 }
 
@@ -66,7 +79,7 @@ function toErrorMessage(err: unknown): string {
 }
 
 function printJson(payload: unknown): void {
-  console.log(JSON.stringify(payload, null, 2));
+  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
 }
 
 function formatLocalTimestamp(value: string | null | undefined): string | null {
@@ -92,8 +105,15 @@ function printAccountLabel(accountId?: string): void {
 }
 
 function resolveMatrixCliAccountId(accountId?: string): string {
+  return resolveMatrixCliActionContext(accountId).accountId;
+}
+
+function resolveMatrixCliActionContext(accountId?: string): { accountId: string; cfg: CoreConfig } {
   const cfg = getMatrixRuntime().config.loadConfig() as CoreConfig;
-  return resolveMatrixAuthContext({ cfg, accountId }).accountId;
+  return {
+    accountId: resolveMatrixAuthContext({ cfg, accountId }).accountId,
+    cfg,
+  };
 }
 
 function formatMatrixCliCommand(command: string, accountId?: string): string {
@@ -290,7 +310,7 @@ async function addMatrixAccount(params: {
     staleOpenClawDeviceIds: [],
   };
   try {
-    const addedDevices = await listMatrixOwnDevices({ accountId });
+    const addedDevices = await listMatrixOwnDevices({ accountId, cfg: updated });
     deviceHealth = {
       currentDeviceId: addedDevices.find((device) => device.current)?.deviceId ?? null,
       staleOpenClawDeviceIds: addedDevices
@@ -346,12 +366,13 @@ async function inspectMatrixDirectRoom(params: {
   accountId: string;
   userId: string;
 }): Promise<MatrixCliDirectRoomInspection> {
+  const cfg = getMatrixRuntime().config.loadConfig() as CoreConfig;
   const [{ withResolvedActionClient }, { inspectMatrixDirectRooms }] = await Promise.all([
     loadMatrixActionClientModule(),
     loadMatrixDirectManagementModule(),
   ]);
   return await withResolvedActionClient(
-    { accountId: params.accountId },
+    { accountId: params.accountId, cfg },
     async (client) => {
       const inspection = await inspectMatrixDirectRooms({
         client,
@@ -381,7 +402,7 @@ async function repairMatrixDirectRoom(params: {
     loadMatrixActionClientModule(),
     loadMatrixDirectManagementModule(),
   ]);
-  return await withStartedActionClient({ accountId: params.accountId }, async (client) => {
+  return await withStartedActionClient({ accountId: params.accountId, cfg }, async (client) => {
     const repaired = await repairMatrixDirectRooms({
       client,
       remoteUserId: params.userId,
@@ -479,6 +500,43 @@ type MatrixCliVerificationStatus = {
   recoveryKeyStored: boolean;
   recoveryKeyCreatedAt: string | null;
   pendingVerifications: number;
+  recoveryKeyAccepted?: boolean;
+  backupUsable?: boolean;
+  deviceOwnerVerified?: boolean;
+};
+
+type MatrixCliVerificationCommandOptions = {
+  account?: string;
+  verbose?: boolean;
+  json?: boolean;
+};
+
+type MatrixCliSelfVerificationCommandOptions = {
+  account?: string;
+  timeoutMs?: string;
+  verbose?: boolean;
+};
+
+type MatrixCliVerificationSummary = {
+  id: string;
+  transactionId?: string;
+  otherUserId: string;
+  otherDeviceId?: string;
+  isSelfVerification: boolean;
+  initiatedByMe: boolean;
+  phaseName: string;
+  pending: boolean;
+  methods: string[];
+  chosenMethod?: string | null;
+  hasSas: boolean;
+  sas?: MatrixCliVerificationSas;
+  completed: boolean;
+  error?: string;
+};
+
+type MatrixCliVerificationSas = {
+  decimal?: [number, number, number];
+  emoji?: Array<[string, string]>;
 };
 
 type MatrixCliDirectRoomCandidate = {
@@ -584,6 +642,151 @@ function printVerificationTrustDiagnostics(status: {
   console.log(`Signed by owner: ${status.signedByOwner ? "yes" : "no"}`);
 }
 
+function printMatrixVerificationSummary(summary: MatrixCliVerificationSummary): void {
+  console.log(`Verification id: ${summary.id}`);
+  if (summary.transactionId) {
+    console.log(`Transaction id: ${summary.transactionId}`);
+  }
+  console.log(`Other user: ${summary.otherUserId}`);
+  console.log(`Other device: ${summary.otherDeviceId ?? "unknown"}`);
+  console.log(`Self-verification: ${summary.isSelfVerification ? "yes" : "no"}`);
+  console.log(`Initiated by OpenClaw: ${summary.initiatedByMe ? "yes" : "no"}`);
+  console.log(`Phase: ${summary.phaseName}`);
+  console.log(`Pending: ${summary.pending ? "yes" : "no"}`);
+  console.log(`Completed: ${summary.completed ? "yes" : "no"}`);
+  console.log(`Methods: ${summary.methods.length ? summary.methods.join(", ") : "none"}`);
+  if (summary.chosenMethod) {
+    console.log(`Chosen method: ${summary.chosenMethod}`);
+  }
+  if (summary.hasSas && summary.sas?.emoji?.length) {
+    console.log(
+      `SAS emoji: ${summary.sas.emoji.map(([emoji, label]) => `${emoji} ${label}`).join(" | ")}`,
+    );
+  } else if (summary.hasSas && summary.sas?.decimal) {
+    console.log(`SAS decimals: ${summary.sas.decimal.join(" ")}`);
+  }
+  if (summary.error) {
+    console.log(`Verification error: ${summary.error}`);
+  }
+}
+
+function printMatrixVerificationSummaries(summaries: MatrixCliVerificationSummary[]): void {
+  if (summaries.length === 0) {
+    console.log("Verifications: none");
+    return;
+  }
+  summaries.forEach((summary, index) => {
+    if (index > 0) {
+      console.log("");
+    }
+    printMatrixVerificationSummary(summary);
+  });
+}
+
+function printMatrixVerificationSas(sas: MatrixCliVerificationSas): void {
+  if (sas.emoji?.length) {
+    console.log(`SAS emoji: ${sas.emoji.map(([emoji, label]) => `${emoji} ${label}`).join(" | ")}`);
+  } else if (sas.decimal) {
+    console.log(`SAS decimals: ${sas.decimal.join(" ")}`);
+  } else {
+    console.log("SAS: unavailable");
+  }
+}
+
+function printMatrixVerificationSasGuidance(requestId: string, accountId?: string): void {
+  printGuidance([
+    `Compare the emoji or decimals with the other Matrix client.`,
+    `If they match, run '${formatMatrixCliCommand(`verify confirm-sas ${requestId}`, accountId)}'.`,
+    `If they do not match, run '${formatMatrixCliCommand(`verify mismatch-sas ${requestId}`, accountId)}'.`,
+  ]);
+}
+
+async function promptMatrixVerificationSasMatch(): Promise<boolean> {
+  const { createInterface } = await import("node:readline/promises");
+  const prompt = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  try {
+    const answer = await prompt.question("Do the emoji or decimals match? Type yes to confirm: ");
+    return /^(?:y|yes)$/i.test(answer.trim());
+  } finally {
+    prompt.close();
+  }
+}
+
+function printMatrixVerificationRequestGuidance(requestId: string, accountId?: string): void {
+  printGuidance([
+    `Accept the verification request in another Matrix client for this account.`,
+    `Then run '${formatMatrixCliCommand(`verify start ${requestId}`, accountId)}' to start SAS verification.`,
+    `Run '${formatMatrixCliCommand(`verify sas ${requestId}`, accountId)}' to display the SAS emoji or decimals.`,
+    `When the SAS matches, run '${formatMatrixCliCommand(`verify confirm-sas ${requestId}`, accountId)}'.`,
+  ]);
+}
+
+async function runMatrixCliVerificationSummaryCommand(params: {
+  options: MatrixCliVerificationCommandOptions;
+  run: (accountId: string, cfg: CoreConfig) => Promise<MatrixCliVerificationSummary>;
+  afterText?: (summary: MatrixCliVerificationSummary, accountId: string) => void;
+  errorPrefix: string;
+}): Promise<void> {
+  const { accountId, cfg } = resolveMatrixCliActionContext(params.options.account);
+  await runMatrixCliCommand({
+    verbose: params.options.verbose === true,
+    json: params.options.json === true,
+    run: async () => await params.run(accountId, cfg),
+    onText: (summary) => {
+      printAccountLabel(accountId);
+      printMatrixVerificationSummary(summary);
+      params.afterText?.(summary, accountId);
+    },
+    errorPrefix: params.errorPrefix,
+  });
+}
+
+async function runMatrixCliSelfVerificationCommand(
+  options: MatrixCliSelfVerificationCommandOptions,
+): Promise<void> {
+  const { accountId, cfg } = resolveMatrixCliActionContext(options.account);
+  await runMatrixCliCommand({
+    verbose: options.verbose === true,
+    json: false,
+    run: async () =>
+      await runMatrixSelfVerification({
+        accountId,
+        cfg,
+        timeoutMs: parseOptionalInt(options.timeoutMs, "--timeout-ms"),
+        onRequested: (summary) => {
+          printAccountLabel(accountId);
+          printMatrixVerificationSummary(summary);
+          console.log("Accept this verification request in another Matrix client.");
+        },
+        onReady: (summary) => {
+          console.log("Verification request accepted.");
+          if (!summary.hasSas) {
+            console.log("Starting SAS verification...");
+          }
+        },
+        onSas: (summary) => {
+          printMatrixVerificationSas(summary.sas ?? {});
+          console.log("Compare this SAS with the other Matrix client.");
+        },
+        confirmSas: async () => await promptMatrixVerificationSasMatch(),
+      }),
+    onText: (summary, verbose) => {
+      printMatrixVerificationSummary(summary);
+      console.log(`Device verified by owner: ${summary.deviceOwnerVerified ? "yes" : "no"}`);
+      printVerificationTrustDiagnostics(summary.ownerVerification);
+      printVerificationBackupSummary(summary.ownerVerification);
+      if (verbose) {
+        printVerificationBackupStatus(summary.ownerVerification);
+      }
+      console.log("Self-verification complete.");
+    },
+    errorPrefix: "Self-verification failed",
+  });
+}
+
 function printVerificationGuidance(status: MatrixCliVerificationStatus, accountId?: string): void {
   printGuidance(buildVerificationGuidance(status, accountId));
 }
@@ -604,9 +807,18 @@ function buildVerificationGuidance(
   const backupIssue = resolveMatrixRoomKeyBackupIssue(backup);
   const nextSteps = new Set<string>();
   if (!status.verified) {
-    nextSteps.add(
-      `Run '${formatMatrixCliCommand("verify device <key>", accountId)}' to verify this device.`,
-    );
+    if (status.recoveryKeyAccepted === true && status.backupUsable === true) {
+      nextSteps.add(
+        `Recovery key can unlock the room-key backup, but full Matrix identity trust is still incomplete. Run '${formatMatrixCliCommand("verify self", accountId)}' and follow the prompts from another Matrix client.`,
+      );
+      nextSteps.add(
+        `If you intend to replace the current cross-signing identity, run '${formatMatrixCliCommand("verify bootstrap --recovery-key <key> --force-reset-cross-signing", accountId)}'.`,
+      );
+    } else {
+      nextSteps.add(
+        `Run '${formatMatrixCliCommand("verify device <key>", accountId)}' to verify this device.`,
+      );
+    }
   }
   if (backupIssue.code === "missing-server-backup") {
     nextSteps.add(
@@ -912,6 +1124,204 @@ export function registerMatrixCli(params: { program: Command }): void {
   const verify = root.command("verify").description("Device verification for Matrix E2EE");
 
   verify
+    .command("list")
+    .description("List pending Matrix verification requests")
+    .option("--account <id>", "Account ID (for multi-account setups)")
+    .option("--verbose", "Show detailed diagnostics")
+    .option("--json", "Output as JSON")
+    .action(async (options: { account?: string; verbose?: boolean; json?: boolean }) => {
+      const { accountId, cfg } = resolveMatrixCliActionContext(options.account);
+      await runMatrixCliCommand({
+        verbose: options.verbose === true,
+        json: options.json === true,
+        run: async () => await listMatrixVerifications({ accountId, cfg }),
+        onText: (summaries) => {
+          printAccountLabel(accountId);
+          printMatrixVerificationSummaries(summaries);
+        },
+        errorPrefix: "Verification listing failed",
+      });
+    });
+
+  verify
+    .command("self")
+    .description("Interactively self-verify this Matrix device")
+    .option("--account <id>", "Account ID (for multi-account setups)")
+    .option("--timeout-ms <ms>", "How long to wait for the other Matrix client")
+    .option("--verbose", "Show detailed diagnostics")
+    .action(async (options: MatrixCliSelfVerificationCommandOptions) => {
+      await runMatrixCliSelfVerificationCommand(options);
+    });
+
+  verify
+    .command("request")
+    .description("Request Matrix device verification from another Matrix client")
+    .option("--account <id>", "Account ID (for multi-account setups)")
+    .option("--own-user", "Request self-verification for this Matrix account")
+    .option("--user-id <id>", "Matrix user ID to verify")
+    .option("--device-id <id>", "Matrix device ID to verify")
+    .option("--room-id <id>", "Matrix direct-message room ID for verification")
+    .option("--verbose", "Show detailed diagnostics")
+    .option("--json", "Output as JSON")
+    .action(
+      async (options: {
+        account?: string;
+        ownUser?: boolean;
+        userId?: string;
+        deviceId?: string;
+        roomId?: string;
+        verbose?: boolean;
+        json?: boolean;
+      }) => {
+        const { accountId, cfg } = resolveMatrixCliActionContext(options.account);
+        await runMatrixCliCommand({
+          verbose: options.verbose === true,
+          json: options.json === true,
+          run: async () => {
+            if (
+              options.ownUser === true &&
+              (options.userId || options.deviceId || options.roomId)
+            ) {
+              throw new Error(
+                "--own-user cannot be combined with --user-id, --device-id, or --room-id",
+              );
+            }
+            return await requestMatrixVerification({
+              accountId,
+              cfg,
+              ownUser: options.ownUser === true ? true : undefined,
+              userId: options.userId,
+              deviceId: options.deviceId,
+              roomId: options.roomId,
+            });
+          },
+          onText: (summary) => {
+            printAccountLabel(accountId);
+            printMatrixVerificationSummary(summary);
+            printMatrixVerificationRequestGuidance(summary.id, accountId);
+          },
+          errorPrefix: "Verification request failed",
+        });
+      },
+    );
+
+  verify
+    .command("accept <id>")
+    .description("Accept an inbound Matrix verification request")
+    .option("--account <id>", "Account ID (for multi-account setups)")
+    .option("--verbose", "Show detailed diagnostics")
+    .option("--json", "Output as JSON")
+    .action(async (id: string, options: MatrixCliVerificationCommandOptions) => {
+      await runMatrixCliVerificationSummaryCommand({
+        options,
+        run: async (accountId, cfg) => await acceptMatrixVerification(id, { accountId, cfg }),
+        afterText: (summary, accountId) => {
+          printGuidance([
+            `Run '${formatMatrixCliCommand(`verify start ${summary.id}`, accountId)}' to start SAS verification.`,
+          ]);
+        },
+        errorPrefix: "Verification accept failed",
+      });
+    });
+
+  verify
+    .command("start <id>")
+    .description("Start SAS verification for a Matrix verification request")
+    .option("--account <id>", "Account ID (for multi-account setups)")
+    .option("--verbose", "Show detailed diagnostics")
+    .option("--json", "Output as JSON")
+    .action(async (id: string, options: MatrixCliVerificationCommandOptions) => {
+      await runMatrixCliVerificationSummaryCommand({
+        options,
+        run: async (accountId, cfg) =>
+          await startMatrixVerification(id, { accountId, cfg, method: "sas" }),
+        afterText: (summary, accountId) =>
+          printMatrixVerificationSasGuidance(summary.id, accountId),
+        errorPrefix: "Verification start failed",
+      });
+    });
+
+  verify
+    .command("sas <id>")
+    .description("Show SAS emoji or decimals for a Matrix verification request")
+    .option("--account <id>", "Account ID (for multi-account setups)")
+    .option("--verbose", "Show detailed diagnostics")
+    .option("--json", "Output as JSON")
+    .action(async (id: string, options: MatrixCliVerificationCommandOptions) => {
+      const { accountId, cfg } = resolveMatrixCliActionContext(options.account);
+      await runMatrixCliCommand({
+        verbose: options.verbose === true,
+        json: options.json === true,
+        run: async () => await getMatrixVerificationSas(id, { accountId, cfg }),
+        onText: (sas) => {
+          printAccountLabel(accountId);
+          console.log(`Verification id: ${id}`);
+          printMatrixVerificationSas(sas);
+          printMatrixVerificationSasGuidance(id, accountId);
+        },
+        errorPrefix: "Verification SAS lookup failed",
+      });
+    });
+
+  verify
+    .command("confirm-sas <id>")
+    .description("Confirm matching SAS emoji or decimals for a Matrix verification request")
+    .option("--account <id>", "Account ID (for multi-account setups)")
+    .option("--verbose", "Show detailed diagnostics")
+    .option("--json", "Output as JSON")
+    .action(async (id: string, options: MatrixCliVerificationCommandOptions) => {
+      await runMatrixCliVerificationSummaryCommand({
+        options,
+        run: async (accountId, cfg) => await confirmMatrixVerificationSas(id, { accountId, cfg }),
+        errorPrefix: "Verification SAS confirm failed",
+      });
+    });
+
+  verify
+    .command("mismatch-sas <id>")
+    .description("Reject a Matrix SAS verification when the emoji or decimals do not match")
+    .option("--account <id>", "Account ID (for multi-account setups)")
+    .option("--verbose", "Show detailed diagnostics")
+    .option("--json", "Output as JSON")
+    .action(async (id: string, options: MatrixCliVerificationCommandOptions) => {
+      await runMatrixCliVerificationSummaryCommand({
+        options,
+        run: async (accountId, cfg) => await mismatchMatrixVerificationSas(id, { accountId, cfg }),
+        errorPrefix: "Verification SAS mismatch failed",
+      });
+    });
+
+  verify
+    .command("cancel <id>")
+    .description("Cancel a Matrix verification request")
+    .option("--account <id>", "Account ID (for multi-account setups)")
+    .option("--reason <text>", "Cancellation reason")
+    .option("--code <code>", "Matrix cancellation code")
+    .option("--verbose", "Show detailed diagnostics")
+    .option("--json", "Output as JSON")
+    .action(
+      async (
+        id: string,
+        options: MatrixCliVerificationCommandOptions & {
+          reason?: string;
+          code?: string;
+        },
+      ) => {
+        await runMatrixCliVerificationSummaryCommand({
+          options,
+          run: async (accountId, cfg) =>
+            await cancelMatrixVerification(id, {
+              accountId,
+              cfg,
+              reason: options.reason,
+              code: options.code,
+            }),
+          errorPrefix: "Verification cancel failed",
+        });
+      },
+    );
+
+  verify
     .command("status")
     .description("Check Matrix device verification status")
     .option("--account <id>", "Account ID (for multi-account setups)")
@@ -925,13 +1335,14 @@ export function registerMatrixCli(params: { program: Command }): void {
         includeRecoveryKey?: boolean;
         json?: boolean;
       }) => {
-        const accountId = resolveMatrixCliAccountId(options.account);
+        const { accountId, cfg } = resolveMatrixCliActionContext(options.account);
         await runMatrixCliCommand({
           verbose: options.verbose === true,
           json: options.json === true,
           run: async () =>
             await getMatrixVerificationStatus({
               accountId,
+              cfg,
               includeRecoveryKey: options.includeRecoveryKey === true,
             }),
           onText: (status, verbose) => {
@@ -952,11 +1363,11 @@ export function registerMatrixCli(params: { program: Command }): void {
     .option("--verbose", "Show detailed diagnostics")
     .option("--json", "Output as JSON")
     .action(async (options: { account?: string; verbose?: boolean; json?: boolean }) => {
-      const accountId = resolveMatrixCliAccountId(options.account);
+      const { accountId, cfg } = resolveMatrixCliActionContext(options.account);
       await runMatrixCliCommand({
         verbose: options.verbose === true,
         json: options.json === true,
-        run: async () => await getMatrixRoomKeyBackupStatus({ accountId }),
+        run: async () => await getMatrixRoomKeyBackupStatus({ accountId, cfg }),
         onText: (status, verbose) => {
           printAccountLabel(accountId);
           printBackupSummary(status);
@@ -979,7 +1390,7 @@ export function registerMatrixCli(params: { program: Command }): void {
     .option("--json", "Output as JSON")
     .action(
       async (options: { account?: string; yes?: boolean; verbose?: boolean; json?: boolean }) => {
-        const accountId = resolveMatrixCliAccountId(options.account);
+        const { accountId, cfg } = resolveMatrixCliActionContext(options.account);
         await runMatrixCliCommand({
           verbose: options.verbose === true,
           json: options.json === true,
@@ -987,7 +1398,7 @@ export function registerMatrixCli(params: { program: Command }): void {
             if (options.yes !== true) {
               throw new Error("Refusing to reset Matrix room-key backup without --yes");
             }
-            return await resetMatrixRoomKeyBackup({ accountId });
+            return await resetMatrixRoomKeyBackup({ accountId, cfg });
           },
           onText: (result, verbose) => {
             printAccountLabel(accountId);
@@ -1025,13 +1436,14 @@ export function registerMatrixCli(params: { program: Command }): void {
         verbose?: boolean;
         json?: boolean;
       }) => {
-        const accountId = resolveMatrixCliAccountId(options.account);
+        const { accountId, cfg } = resolveMatrixCliActionContext(options.account);
         await runMatrixCliCommand({
           verbose: options.verbose === true,
           json: options.json === true,
           run: async () =>
             await restoreMatrixRoomKeyBackup({
               accountId,
+              cfg,
               recoveryKey: options.recoveryKey,
             }),
           onText: (result, verbose) => {
@@ -1074,13 +1486,14 @@ export function registerMatrixCli(params: { program: Command }): void {
         verbose?: boolean;
         json?: boolean;
       }) => {
-        const accountId = resolveMatrixCliAccountId(options.account);
+        const { accountId, cfg } = resolveMatrixCliActionContext(options.account);
         await runMatrixCliCommand({
           verbose: options.verbose === true,
           json: options.json === true,
           run: async () =>
             await bootstrapMatrixVerification({
               accountId,
+              cfg,
               recoveryKey: options.recoveryKey,
               forceResetCrossSigning: options.forceResetCrossSigning === true,
             }),
@@ -1129,19 +1542,39 @@ export function registerMatrixCli(params: { program: Command }): void {
     .option("--json", "Output as JSON")
     .action(
       async (key: string, options: { account?: string; verbose?: boolean; json?: boolean }) => {
-        const accountId = resolveMatrixCliAccountId(options.account);
+        const { accountId, cfg } = resolveMatrixCliActionContext(options.account);
         await runMatrixCliCommand({
           verbose: options.verbose === true,
           json: options.json === true,
-          run: async () => await verifyMatrixRecoveryKey(key, { accountId }),
+          run: async () => await verifyMatrixRecoveryKey(key, { accountId, cfg }),
           onText: (result, verbose) => {
             printAccountLabel(accountId);
             if (!result.success) {
               console.error(`Verification failed: ${result.error ?? "unknown error"}`);
+              printVerificationIdentity(result);
+              console.log(`Recovery key accepted: ${result.recoveryKeyAccepted ? "yes" : "no"}`);
+              console.log(`Backup usable: ${result.backupUsable ? "yes" : "no"}`);
+              console.log(`Device verified by owner: ${result.deviceOwnerVerified ? "yes" : "no"}`);
+              printVerificationBackupSummary(result);
+              if (verbose) {
+                printVerificationTrustDiagnostics(result);
+                printVerificationBackupStatus(result);
+                printTimestamp("Recovery key created at", result.recoveryKeyCreatedAt);
+              }
+              printVerificationGuidance(
+                {
+                  ...result,
+                  pendingVerifications: 0,
+                },
+                accountId,
+              );
               return;
             }
             console.log("Device verification completed successfully.");
             printVerificationIdentity(result);
+            console.log(`Recovery key accepted: ${result.recoveryKeyAccepted ? "yes" : "no"}`);
+            console.log(`Backup usable: ${result.backupUsable ? "yes" : "no"}`);
+            console.log(`Device verified by owner: ${result.deviceOwnerVerified ? "yes" : "no"}`);
             printVerificationBackupSummary(result);
             if (verbose) {
               printVerificationTrustDiagnostics(result);
@@ -1173,11 +1606,11 @@ export function registerMatrixCli(params: { program: Command }): void {
     .option("--verbose", "Show detailed diagnostics")
     .option("--json", "Output as JSON")
     .action(async (options: { account?: string; verbose?: boolean; json?: boolean }) => {
-      const accountId = resolveMatrixCliAccountId(options.account);
+      const { accountId, cfg } = resolveMatrixCliActionContext(options.account);
       await runMatrixCliCommand({
         verbose: options.verbose === true,
         json: options.json === true,
-        run: async () => await listMatrixOwnDevices({ accountId }),
+        run: async () => await listMatrixOwnDevices({ accountId, cfg }),
         onText: (result) => {
           printAccountLabel(accountId);
           printMatrixOwnDevices(result);
@@ -1193,11 +1626,11 @@ export function registerMatrixCli(params: { program: Command }): void {
     .option("--verbose", "Show detailed diagnostics")
     .option("--json", "Output as JSON")
     .action(async (options: { account?: string; verbose?: boolean; json?: boolean }) => {
-      const accountId = resolveMatrixCliAccountId(options.account);
+      const { accountId, cfg } = resolveMatrixCliActionContext(options.account);
       await runMatrixCliCommand({
         verbose: options.verbose === true,
         json: options.json === true,
-        run: async () => await pruneMatrixStaleGatewayDevices({ accountId }),
+        run: async () => await pruneMatrixStaleGatewayDevices({ accountId, cfg }),
         onText: (result, verbose) => {
           printAccountLabel(accountId);
           console.log(
